@@ -30,6 +30,9 @@ integrations/abound/tests/source_env_vars.sh
 
 target/
 
+# Build logs (local compile output, not source)
+build.log
+
 # Python
 __pycache__/
 *.pyc

@@ -1,17 +1,15 @@
 ---
 paths:
-  - "crates/ironclaw_capabilities/**"
-  - "crates/ironclaw_host_api/**"
-  - "crates/ironclaw_host_runtime/**"
-  - "crates/ironclaw_dispatcher/**"
-  - "crates/ironclaw_extensions/**"
-  - "crates/ironclaw_first_party_extensions/**"
-  - "crates/ironclaw_mcp/**"
-  - "crates/ironclaw_wasm/**"
-  - "tools-src/**"
-  - "src/tools/**"
-  - "src/channels/**"
-  - "src/cli/**"
+  - "crates/kernel/ironclaw_capabilities/**"
+  - "crates/contracts/ironclaw_host_api/**"
+  - "crates/kernel/ironclaw_host_runtime/**"
+  - "crates/product/ironclaw_assistant/**"
+  - "crates/extensions/ironclaw_extension_host/**"
+  - "crates/extensions/packages/**"
+  - "crates/product/ironclaw_webui/**"
+  - "crates/app/ironclaw_composition/**"
+  - "crates/loop/ironclaw_agent_loop/**"
+  - "crates/loop/ironclaw_turn_runner/**"
 ---
 # Reborn capability architecture
 
@@ -24,14 +22,20 @@ The stable ownership split is:
 - `ironclaw_host_api`: neutral request, authority, resource, and result types.
 - `ironclaw_capabilities`: caller-facing invoke/resume/spawn workflow.
 - authorization/approvals/runtime-policy: decisions and leases.
-- `ironclaw_host_runtime`: obligations and host-mediated services.
-- `ironclaw_dispatcher`: already-authorized routing to runtime adapters.
+- `ironclaw_host_runtime`: obligations, host-mediated services, and the closed
+  lane executor whose dispatch composition routes an already-authorized request
+  to a runtime adapter.
 - WASM/MCP/scripts/first-party adapters: concrete execution lanes.
-- `ironclaw_extensions`: declarative manifests and installation records only.
+- `ironclaw_extension_registry`: declarative manifests and installation records
+  only.
 
-Verify the current call path with targeted symbol search before editing it:
+Verify the current call path with the codebase knowledge graph before editing
+it: check graph freshness, search the capability owners, and trace inbound and
+outbound calls. Then verify the graph result against live code with targeted
+symbol search (or use that search directly when the graph is unavailable):
 
 ```bash
+bash scripts/codebase-graph.sh status
 rg -n "CapabilityHost|RuntimeAdapter|dispatch|invoke|resume|Obligation" \
   crates
 ```
@@ -88,7 +92,7 @@ no authorization, approval, resource, audit, or runtime obligation is lost.
 Review for parallel pipelines with:
 
 ```bash
-rg -n "\.dispatch\(|\.invoke\(|\.resume\(" crates/ironclaw_product_workflow \
-  crates/ironclaw_reborn_composition crates/ironclaw_webui_v2
+rg -n "\.dispatch\(|\.invoke\(|\.resume\(" crates/product/ironclaw_assistant \
+  crates/app/ironclaw_composition crates/product/ironclaw_webui
 rg -n "RuntimeAdapter|CapabilityHost" crates
 ```

@@ -8,6 +8,7 @@ from playwright.async_api import expect
 
 from helpers import REBORN_V2_AUTH_TOKEN, SEL_V2
 from reborn_webui_harness import (
+    install_fake_v2_event_stream,
     USER_ID,
     reborn_v2_browser,  # noqa: F401 - imported fixture
     reborn_v2_server,  # noqa: F401 - imported fixture
@@ -68,39 +69,16 @@ async def _open_stubbed_auth_thread(
     thread_records = thread_records or default_thread_records
     timelines = timelines or default_timelines
 
+    await install_fake_v2_event_stream(page)
+    # OAuth-open stub shared by the legacy auth flows: records every window.open
+    # so tests can assert the browser is never handed an untrusted URL.
     await page.add_init_script(
         """
         (() => {
-          const streams = [];
           window.__openedAuth = [];
           window.open = (url, target, features) => {
             window.__openedAuth.push({ url, target, features });
             return null;
-          };
-          class FakeEventSource extends EventTarget {
-            constructor(url) {
-              super();
-              this.url = url;
-              this.readyState = 0;
-              streams.push(this);
-              setTimeout(() => {
-                this.readyState = 1;
-                if (typeof this.onopen === "function") this.onopen(new Event("open"));
-              }, 0);
-            }
-            close() {
-              this.readyState = 2;
-            }
-          }
-          window.EventSource = FakeEventSource;
-          window.__emitV2Sse = (type, frame, id = "cursor-auth") => {
-            const stream = streams[streams.length - 1];
-            if (!stream) throw new Error("no EventSource stream is open");
-            const event = new MessageEvent(type, {
-              data: JSON.stringify({ type, ...frame }),
-              lastEventId: id,
-            });
-            stream.dispatchEvent(event);
           };
         })();
         """
@@ -117,6 +95,7 @@ async def _open_stubbed_auth_thread(
         await fulfill_json(
             route,
             {
+                "session_channel_extension_id": "web-app",
                 "tenant_id": "reborn-v2-e2e",
                 "user_id": USER_ID,
                 "capabilities": {},
@@ -190,7 +169,7 @@ async def _open_stubbed_auth_thread(
         handle_resolve,
     )
 
-    await page.goto(f"{reborn_v2_server}/v2/chat/{THREAD_ID}?token={REBORN_V2_AUTH_TOKEN}")
+    await page.goto(f"{reborn_v2_server}/chat/{THREAD_ID}?token={REBORN_V2_AUTH_TOKEN}")
     await expect(page.locator(SEL_V2["chat_composer"])).to_be_visible(timeout=15000)
     await expect(page.locator(SEL_V2["msg_user"]).first).to_contain_text(
         "Use a protected integration", timeout=15000
@@ -382,7 +361,7 @@ async def test_reborn_legacy_manual_token_cancel_resolves_gate_without_token_sub
         assert f"/threads/{THREAD_ID}/runs/{RUN_ID}/gates/manual-token-cancel-gate/resolve" in (
             resolve_requests[0]["url"]
         )
-        assert resolve_requests[0]["body"]["resolution"] == "cancelled"
+        assert resolve_requests[0]["body"]["resolution"] == "declined"
         assert resolve_requests[0]["body"]["always"] is False
         assert resolve_requests[0]["body"]["client_action_id"]
     finally:
@@ -542,7 +521,7 @@ async def test_reborn_legacy_auth_prompt_does_not_block_other_thread(
             ),
         )
 
-    await page.route(f"**/api/webchat/v2/threads/{THREAD_B_ID}/messages", handle_send_b)
+    await page.route("**/api/webchat/v2/channels/*/messages", handle_send_b)
 
     try:
         await _emit_auth_prompt(
@@ -648,7 +627,7 @@ async def test_reborn_legacy_oauth_prompt_opens_https_authorization_only(
         await gate.get_by_role("button", name="Cancel").click()
         await expect(gate).to_be_hidden(timeout=5000)
         assert len(resolve_requests) == 1
-        assert resolve_requests[0]["body"]["resolution"] == "cancelled"
+        assert resolve_requests[0]["body"]["resolution"] == "declined"
     finally:
         await context.close()
 

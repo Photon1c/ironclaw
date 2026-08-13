@@ -8,6 +8,7 @@ from playwright.async_api import expect
 
 from helpers import REBORN_V2_AUTH_TOKEN, SEL_V2
 from reborn_webui_harness import (
+    install_fake_v2_event_stream,
     USER_ID,
     reborn_v2_browser,  # noqa: F401 - imported fixture
     reborn_v2_server,  # noqa: F401 - imported fixture
@@ -57,38 +58,7 @@ def _submitted_response() -> dict:
 
 
 async def _install_fake_event_source(page):
-    await page.add_init_script(
-        """
-        (() => {
-          const streams = [];
-          class FakeEventSource extends EventTarget {
-            constructor(url) {
-              super();
-              this.url = url;
-              this.readyState = 0;
-              streams.push(this);
-              setTimeout(() => {
-                this.readyState = 1;
-                if (typeof this.onopen === "function") this.onopen(new Event("open"));
-              }, 0);
-            }
-            close() {
-              this.readyState = 2;
-            }
-          }
-          window.EventSource = FakeEventSource;
-          window.__emitV2Sse = (type, frame, id = "cursor-1") => {
-            const stream = streams[streams.length - 1];
-            if (!stream) throw new Error("no EventSource stream is open");
-            const event = new MessageEvent(type, {
-              data: JSON.stringify({ type, ...frame }),
-              lastEventId: id,
-            });
-            stream.dispatchEvent(event);
-          };
-        })();
-        """
-    )
+    await install_fake_v2_event_stream(page)
 
 
 async def _wait_for_request_count(requests: list, count: int, *, timeout: float = 5.0) -> None:
@@ -146,6 +116,7 @@ async def _open_mocked_pending_page(
         await fulfill_json(
             route,
             {
+                "session_channel_extension_id": "web-app",
                 "tenant_id": "reborn-v2-e2e",
                 "user_id": USER_ID,
                 "capabilities": {},
@@ -186,10 +157,10 @@ async def _open_mocked_pending_page(
     await page.route("**/api/webchat/v2/session", handle_session)
     await page.route("**/api/webchat/v2/threads", handle_threads)
     await page.route("**/api/webchat/v2/threads/*/timeline**", handle_timeline)
-    await page.route(f"**/api/webchat/v2/threads/{THREAD_ID}/messages", handle_send)
+    await page.route("**/api/webchat/v2/channels/*/messages", handle_send)
 
     await page.goto(
-        f"{reborn_v2_server}/v2/chat/{initial_thread_id}?token={REBORN_V2_AUTH_TOKEN}"
+        f"{reborn_v2_server}/chat/{initial_thread_id}?token={REBORN_V2_AUTH_TOKEN}"
     )
     await expect(page.locator(SEL_V2["chat_composer"])).to_be_visible(timeout=15000)
     # Composer visibility alone does not prove the route's thread has hydrated.
@@ -558,7 +529,7 @@ async def test_reborn_legacy_sidebar_cache_keeps_active_thread_outside_summary_w
         page = harness["page"]
         composer = page.locator(SEL_V2["chat_composer"])
         await expect(composer).to_be_visible(timeout=15000)
-        assert await page.evaluate("() => location.pathname") == f"/v2/chat/{THREAD_ID}"
+        assert await page.evaluate("() => location.pathname") == f"/chat/{THREAD_ID}"
 
         harness["threads"][:] = [
             {
@@ -584,7 +555,7 @@ async def test_reborn_legacy_sidebar_cache_keeps_active_thread_outside_summary_w
             harness["send_requests"][0]["content"]
             == "Summary refresh should keep this Reborn thread"
         )
-        assert await page.evaluate("() => location.pathname") == f"/v2/chat/{THREAD_ID}"
+        assert await page.evaluate("() => location.pathname") == f"/chat/{THREAD_ID}"
         await expect(composer).to_be_visible(timeout=5000)
         await expect(
             page.locator(SEL_V2["sidebar"]).get_by_role("button").filter(
@@ -785,7 +756,7 @@ async def test_reborn_legacy_processing_indicator_does_not_leak_after_thread_swi
 
         await quiet_thread.click()
         await page.wait_for_function(
-            "(threadId) => location.pathname === `/v2/chat/${threadId}`",
+            "(threadId) => location.pathname === `/chat/${threadId}`",
             arg=OTHER_THREAD_ID,
             timeout=10000,
         )
@@ -823,7 +794,9 @@ async def test_reborn_legacy_failed_send_marks_single_error_message(
             has_text="send-failure cleanup test"
         )
         await expect(failed).to_have_count(1, timeout=5000)
-        await expect(failed).to_contain_text("Service unavailable")
+        await expect(failed).to_contain_text(
+            "The request failed: service_unavailable."
+        )
         await expect(failed.get_by_label("Retry message")).to_be_visible()
         assert len(harness["send_requests"]) == 1
     finally:
@@ -858,13 +831,20 @@ async def test_reborn_legacy_failed_send_retry_resubmits_message(
             has_text="retry failed send test"
         )
         await expect(failed).to_have_count(1, timeout=5000)
-        await expect(failed).to_contain_text("Service unavailable")
+        await expect(failed).to_contain_text(
+            "The request failed: service_unavailable."
+        )
 
         await failed.get_by_label("Retry message").click()
 
         await expect(failed).to_have_count(1, timeout=5000)
-        await expect(failed).not_to_contain_text("Service unavailable")
+        await expect(failed).not_to_contain_text(
+            "The request failed: service_unavailable."
+        )
         await expect(failed.get_by_label("Retry message")).to_have_count(0)
+        await expect(page.locator(SEL_V2["typing_indicator"])).to_be_visible(
+            timeout=5000
+        )
         assert [request["content"] for request in harness["send_requests"]] == [
             "retry failed send test",
             "retry failed send test",

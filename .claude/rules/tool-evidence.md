@@ -1,14 +1,14 @@
 ---
 paths:
-  - "crates/ironclaw_capabilities/**"
-  - "crates/ironclaw_host_runtime/**"
-  - "crates/ironclaw_dispatcher/**"
-  - "crates/ironclaw_product_workflow/**"
-  - "crates/ironclaw_first_party_extensions/**"
-  - "crates/ironclaw_webui_v2/**"
-  - "crates/ironclaw_reborn_composition/**"
-  - "crates/ironclaw_agent_loop/**"
-  - "crates/ironclaw_runner/**"
+  - "crates/kernel/ironclaw_capabilities/**"
+  - "crates/kernel/ironclaw_host_runtime/**"
+  - "crates/product/ironclaw_assistant/**"
+  - "crates/extensions/ironclaw_extension_host/**"
+  - "crates/extensions/packages/**"
+  - "crates/product/ironclaw_webui/**"
+  - "crates/app/ironclaw_composition/**"
+  - "crates/loop/ironclaw_agent_loop/**"
+  - "crates/loop/ironclaw_turn_runner/**"
 ---
 # Capability evidence and side-effect verification
 
@@ -22,7 +22,7 @@ The loop may claim completion only from the structured capability outcome and
 its admitted evidence. Model prose such as “done,” an empty output, or a locally
 constructed success string is not evidence. Correctable failures stay
 model-visible so the loop can retry or explain them; host/infra failures remain
-terminal according to `agent-loop-capabilities.md`.
+terminal instead.
 
 Examples:
 
@@ -31,6 +31,14 @@ Examples:
 - Installation and activation read back the durable lifecycle state.
 - OAuth completion performs a minimal authenticated read before success.
 - Trigger or automation changes read back the stored definition and schedule.
+- Outbound delivery (host-emitted or the model's own `builtin.outbound_deliver`
+  call) returns the provider-issued message reference from the coordinator's
+  `Delivered` outcome — which the coordinator emits only after the durable
+  terminal write commits. When the provider accepted the send but that write
+  fails, the coordinator returns `DeliveredUnconfirmed` (refs retained,
+  `durably_recorded: false` on the wire): the explicit weaker evidence type,
+  never a fabricated `Delivered` and never an error that would invite a
+  duplicate resend.
 
 Empty output from a capability that promises data is an error unless the
 contract explicitly defines an empty success. Fast completion is not itself

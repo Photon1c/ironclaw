@@ -10,7 +10,7 @@
 
 The trigger system owns scheduled trigger intake, trigger records, source-provider evaluation, and conversion of a due trigger into a synthetic inbound turn.
 
-It does **not** own a parallel agent loop, product adapter lifecycles, or outbound delivery targets. A trigger fire is routed into the normal Reborn turn pipeline and then persists through the same turn, run, and recovery machinery as any other inbound submission.
+It does **not** own a parallel agent loop, channel-adapter lifecycles, or outbound delivery targets. A trigger fire is routed into the normal Reborn turn pipeline and then persists through the same turn, run, and recovery machinery as any other inbound submission.
 
 ---
 
@@ -118,6 +118,10 @@ It is the source of truth for fire eligibility.
 Pre-submit permanent failures are handled separately by the worker: `Once`
 triggers complete on failure so the one-shot slot is retired, while exhausted
 Cron triggers stay `Scheduled`/retryable for manual investigation or removal.
+After that state transition is durably visible, the settlement observer emits
+a typed failed-fire event. Composition may hand that event to the ordinary
+outbound notification policy, but the poller never sends a message itself and
+no synthetic run or thread-history row is created.
 
 Run threads for completed triggers remain accessible by design; their history is
 retained user data and must not become unreachable when the trigger transitions
@@ -144,6 +148,7 @@ TriggerFire {
     agent_id,
     project_id,
     prompt,
+    delivery_target,
 }
 ```
 
@@ -228,7 +233,7 @@ plumbing, not capability APIs.
   queries used by the trusted poller path.
 - Trigger-owned poller code must keep worker-local call sites explicit about the
   trusted poller transition without adding a user-facing capability surface.
-- Product adapters, first-party capability code, and other untrusted callers
+- Channel adapters, first-party capability code, and other untrusted callers
   must not treat the global list methods as a user-facing surface.
 - The poller may continue to use the raw repository methods internally, but the
   contract treats them as implementation plumbing, not a capability contract.
@@ -242,7 +247,7 @@ A trigger fire is synthetic inbound, not a parallel agent loop.
 - The fire must enter the normal Reborn inbound/turn pipeline.
 - The trusted submitter implementation is conversation-owned and exposed to host composition through `trusted_trigger_fire_submitter(...) -> Arc<dyn TrustedTriggerFireSubmitter>`. This public factory is wiring only; trusted authority lives in the sealed `TrustedTriggerSubmitRequest` minted by the trigger worker. The raw `TrustedInboundTurnRequest` constructor and concrete submitter type stay private inside `ironclaw_conversations`; host/composition code only wires the trait object into the poller while the conversation crate converts the worker-carried canonical binding into the private trusted turn request.
 - Binding resolution for trigger fires must use the trusted-scope path from `conversation-binding.md`.
-- Product adapters, first-party capabilities, and product workflow code must not construct the conversation-owned trusted trigger submitter or submit `TrustedTriggerSubmitRequest`. PR18.5a enforces this with a private trusted request and architecture tests over adapter/product paths.
+- Channel adapters, first-party capabilities, and product-surface code must not construct the conversation-owned trusted trigger submitter or submit `TrustedTriggerSubmitRequest`. PR18.5a enforces this with a private trusted request and architecture tests over adapter/product paths.
 - The host mints the trusted trigger ingress request from `TriggerRecord` state:
   `tenant_id`, `creator_user_id`, `agent_id`, and `project_id` are host state,
   not product payload data.
@@ -283,11 +288,27 @@ A trigger fire is synthetic inbound, not a parallel agent loop.
   project is not a wildcard.
 - The trusted inbound request is a host-owned synthetic inbound shape around the ordinary inbound fields. It carries only ingress identity and turn scope data needed to create the canonical turn, and it has no adapter-supplied requested-scope hints before binding resolution.
 - It must not encode delivery targets, notification targets, or any other outbound routing policy.
+- Prompt assembly for `TurnOriginKind::ScheduledTrigger` must append the
+  unattended scheduled-run protocol in memory. That protocol tells the model
+  that no human is present, requires it to perform the stored task instead of
+  ending with a question or menu, permits only bounded assumptions within the
+  stored request, identifies the final reply as the run's recorded output, and
+  preserves host approval, authentication, authorization, and policy gates.
+  The trusted turn origin is the switch; an interactive run must not receive
+  this protocol merely because it shares a run profile or process.
+- A graceful scheduled-trigger exit is valid only when its final assistant
+  reply is non-empty and its trimmed final line does not end in `?`. Empty
+  replies and question-ending replies use the existing bounded, tools-capable
+  completion-nudge path. If no further nudge is available, the loop exits with
+  `invalid_model_output` instead of `Completed`. Every rejected assistant reply
+  remains in the transcript and failed-exit evidence. This validation is keyed
+  on `TurnOriginKind::ScheduledTrigger`; interactive question-ending replies
+  retain their conversational completion behavior.
 
 Host-trusted trigger ingress request fields are:
 
 - `source`: `TriggerFire`;
-- `adapter_kind`: host-trusted trigger ingress marker, not a product adapter kind;
+- `adapter_kind`: host-trusted trigger ingress marker, not a channel adapter kind;
 - `adapter_installation_id`: host-trusted trigger installation marker;
 - `external_actor_ref`: canonical actor route for the trigger creator authority;
 - `external_conversation_ref`: synthetic trigger conversation key plus the
@@ -401,7 +422,13 @@ and submit-result bookkeeping:
 - `ironclaw_triggers::ClearActiveFireRequest` plus
   `TriggerRepository::clear_active_fire` clears only the exact matching
   `(tenant_id, trigger_id, active_fire_slot, active_run_ref)` after the caller
-  has observed a terminal turn outcome.
+  has observed a terminal turn outcome;
+- after an accepted run is durably cleared with `TriggerRunHistoryStatus::Error`,
+  `TriggerFireSettlementObserver::on_run_failure_settled` receives the exact
+  tenant, trigger, fire-slot, and run identities. Successful terminal runs and
+  clear races do not emit this failure settlement. The observer is an
+  automation-health signal only; it does not mint a replacement turn or bypass
+  the normal triggered-run delivery watcher.
 
 The poller treats per-record due-fire processing and active-run terminal lookup
 errors as structured tick report outcomes so one bad record does not block other
@@ -413,7 +440,9 @@ trigger turn is waiting for human interaction, the trigger remains active throug
 `active_run_ref` back-pressure. Later lifecycle/notification work must define
 durable gate expiry, stale gate rejection, reminder throttling, and user/admin
 notification paths without making the trigger poller deliver outbound messages
-directly.
+directly. A permanently failed pre-submit fire uses the same rule: notification
+starts only after durable failure settlement, carries a stable fire identity
+for idempotency, and records no `TurnRunId` because no run exists.
 
 ---
 
@@ -445,16 +474,24 @@ The trigger system must expose `trigger_create`, `trigger_list`, `trigger_remove
 - `trigger_remove` is caller-scoped delete.
 - `trigger_pause` and `trigger_resume` are caller-scoped state transitions
   (`Scheduled` <-> `Paused`); the poller does not fire a paused trigger.
-- Local-dev builds compiled with `libsql` store trigger records in the
-  local-dev libSQL database (`reborn-local-dev.db`) through the same
-  `TriggerRepository` contract used by production libSQL. Local-dev builds
-  without `libsql` keep the existing in-memory repository behavior.
+  Resuming a recurring trigger atomically rebases `next_run_at` to the first
+  future schedule slot, so slots elapsed during the pause are not replayed as
+  catch-up deliveries. A paused fire-once trigger retains its original slot
+  and remains eligible to fire exactly once when resumed.
+- Local-dev builds store trigger records in the local-dev libSQL database
+  (`reborn-local-dev.db`) through the same `TriggerRepository` contract used
+  by production libSQL.
+- Production libSQL composition constructs one `LibSqlRuntime` for the
+  database and passes it to both the root filesystem and trigger repository.
+  Trigger reads use the runtime's concurrent reader lane; migrations and
+  mutations hold its sole writer lease through commit or rollback. PostgreSQL
+  repository pooling remains unchanged.
 - A scheduled-trigger fire resolves a dedicated `scheduled_trigger` run
   profile, not the interactive default. That profile's capability surface
   denies `trigger_create`, `trigger_remove`, `trigger_pause`, and
-  `trigger_resume` via a host-level per-surface-profile deny decorator
-  (`PerSurfaceCapabilityDenyDecorator` in `ironclaw_loop_host`, composed in
-  `ironclaw_runner::runtime`). Read-only `trigger_list` remains visible and
+  `trigger_resume` by subtracting them from the one resolved
+  `ironclaw_host_api::capability_surface::CapabilitySurfacePolicy` in
+  `ironclaw_turn_runner::runtime`. Read-only `trigger_list` remains visible and
   callable during a fire, so a routine can still inspect triggers. This
   prevents a fired trigger's own run from creating or mutating the trigger
   fleet — a malformed or self-referential routine prompt could otherwise
@@ -484,18 +521,40 @@ the outbound delivery track. Product-facing outbound preference APIs and
 explicit provider-backed target tooling own discovery and approval-gated
 selection. Local-dev Reborn exposes model-visible outbound target
 discovery/selection capabilities that write the caller's final-reply
-preference. When a user asks to send routine or trigger results through a
-delivery product/channel, model-visible trigger surfaces must steer the model to
-discover and select an outbound delivery target before calling
-`trigger_create`; durable selection remains product-owned and trigger records
-still do not embed delivery targets.
+preference. A trigger may also persist an optional opaque `delivery_target` id
+selected from that creator-scoped registry; the fire carries the id without
+placing it in `TriggerFireIdentity`. At fire time, the product run-delivery
+workflow re-resolves the id for the creator through an assembled provider,
+obtains the current typed reply-target binding, and sends
+ordinary results through the outbound delivery-resolution path. Missing,
+foreign, disconnected, or removed targets fail closed. Triggers without an
+explicit target retain the user-wide preference fallback.
+
+When a user asks to send routine or trigger results through a delivery
+product/channel, model-visible trigger surfaces must steer the model to discover
+and select an outbound delivery target before calling `trigger_create`.
 
 - Trigger ingress identity must not include delivery targets.
 - Trigger record identity must not include delivery targets.
 - Trigger fire identity must not include delivery targets.
-- When delivery is added, it must flow through the delivery-resolution/outbound contract track, not through trigger ingress identity.
+- A trigger record and fire may carry the optional opaque target id outside
+  their identity fields.
+- Delivery flows through the delivery-resolution/outbound contract track, not
+  through trigger ingress identity.
 
-V1 acceptance does not require external delivery. A valid V1 trigger fire is one that submits a cron-backed synthetic inbound turn and persists through the normal Reborn turn path.
+The historical V1 acceptance milestone did not require external delivery. The
+shipping product contract does: a fire persists its typed, creator-scoped
+delivery selection and the ordinary run-delivery path consumes that authority
+after completion. An omitted selection inherits the sealed source route; an
+explicit target is re-resolved at send time and fails closed if it is removed,
+unpaired, revoked, stale, foreign, or otherwise unavailable. WebApp selection
+persists the result without external egress. Trigger execution itself still
+does not choose, parse, or infer a destination. (✎ 2026-08-08: the retired
+in-app "WebApp selection" sentence above describes the pre-#7157 stored-target
+model; under the shipped two-lane model the `web-app` catalog target is a
+real external destination — a routine that should notify the browser pins it
+in the prompt's delivery step like any channel target, and the
+notification-channel set fans gate/auth/failure notices to it when selected.)
 
 ---
 

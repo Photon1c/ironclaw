@@ -23,7 +23,8 @@ mod reborn_support;
 #[path = "../../support/mod.rs"]
 mod support;
 
-mod scenario_delivery_target_fail_closed;
+mod scenario_scheduled_final_output;
+mod scenario_trigger_create_has_no_delivery_target_field;
 mod scenario_trigger_persists_after_reopen;
 mod scenario_trigger_self_create_denied;
 mod scenario_triggered_chained_gate;
@@ -53,7 +54,7 @@ async fn triggers_group_e2e() {
         scenario_trigger_persists_after_reopen::run(&g).await,
     );
     // W5-WEBUI-API-1: independent of `verbs_lifecycle` — mints its own
-    // trigger, then lists it back through the real WebUI automations facade
+    // trigger, then lists it back through the real WebUI automations service
     // over the group's shared trigger repository.
     report.record(
         "webui_automations_list",
@@ -72,12 +73,15 @@ async fn triggers_group_e2e() {
     //   - gate raise/approve/deny/resume: `triggered_gate_group` below
     //   - one-shot fire -> Completed: `trigger_poller_e2e.rs` + `repository_contract.rs`
     //   - reply persists in trigger's own thread: `reborn_integration_triggered_submit.rs`
-    //   - push leg (trigger -> Slack outbound delivery): `slack_host_beta.rs`
+    //   - push leg (trigger -> channel outbound delivery):
+    //     `trigger_poller_e2e.rs::scheduled_trigger_results_reach_exact_slack_targets_once_across_restart`
+    //     joins the production poller/run graph to the generic post-submit
+    //     hook and real Slack adapter; `channel_host/e2e_tests.rs` retains
+    //     the focused channel-host contracts.
     //
-    // Still BLOCKED at int tier: the PUSH half. `deliver_triggered_run` is a
-    // private fn reachable only via a detached `tokio::spawn` hook, not wired
-    // into any harness turn lifecycle — covered instead by `slack_delivery.rs`'s
-    // own `#[cfg(test)]` module + `outbound_delivery_contract.rs`.
+    // This grouped int-tier harness still does not expose the detached
+    // post-submit hook directly; the composition whole-runtime test above
+    // covers that asynchronous boundary through its durable outcome store.
 
     // C-DENYEDGE row 4: a scheduled-trigger fire must not be able to create
     // its own follow-up trigger. Uses THIS group's `triggers()` capability
@@ -89,15 +93,66 @@ async fn triggers_group_e2e() {
         scenario_trigger_self_create_denied::run(&g).await,
     );
 
-    // Per-trigger delivery routing fails closed on a host with no outbound
-    // delivery target providers: routed create rejected, nothing persisted.
-    // Accept path is dispatch-tier + composition-tier (see scenario doc).
+    // Routines carry no stored delivery route: the model-visible create schema
+    // omits it, a create without it round-trips clean, and a stored-target-era
+    // record still reads back through the real tool surface. Independent of
+    // `verbs_lifecycle` (own trigger names/thread).
     report.record(
-        "delivery_target_fail_closed",
-        scenario_delivery_target_fail_closed::run(&g).await,
+        "trigger_create_has_no_delivery_target_field",
+        scenario_trigger_create_has_no_delivery_target_field::run(&g).await,
     );
 
     report.assert_all_passed();
+}
+
+/// #7525: an unattended run that repeatedly asks the absent user a question
+/// consumes exactly the two existing nudges, then fails with retained
+/// transcript evidence instead of reporting false success.
+///
+/// This has its own test because `triggers_group_e2e` is already a large
+/// sequential async future; keeping the independent scenario separate avoids
+/// inflating that test's stack footprint.
+#[test]
+fn scheduled_final_output_group() {
+    run_async_test_with_stack(
+        "scheduled_final_output_group",
+        scheduled_final_output_group_inner,
+    );
+}
+
+async fn scheduled_final_output_group_inner() {
+    let g = RebornIntegrationGroup::triggers()
+        .await
+        .expect("group builds");
+    let mut report = ScenarioReport::new();
+
+    report.record(
+        "scheduled_final_output_validation",
+        scenario_scheduled_final_output::run(&g).await,
+    );
+
+    report.assert_all_passed();
+}
+
+fn run_async_test_with_stack<F, Fut>(name: &'static str, test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio test runtime")
+                .block_on(test());
+        })
+        .expect("spawn stack-sized test thread");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 /// Triggered-origin runs raise, park on, and resume from REAL approval gates,

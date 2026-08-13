@@ -1,7 +1,6 @@
 ---
 paths:
   - "crates/**/*.rs"
-  - "src/**/*.rs"
 ---
 # Architecture Discipline — Stop the Sprawl Before It Ships
 
@@ -23,8 +22,9 @@ complains, the answer is almost never `#[allow]`.**
 
 clippy's default is 7 args. Reaching it means the function has more
 inputs than a reader can hold in their head. Allowing it once is a
-trade — allowing it eleven times is a refactor someone declined to
-do.
+trade — allowing it 38 times across 26 files (measured on this tree with
+`rg -c '#\[allow\(clippy::too_many_arguments\)\]' crates/`) is a refactor
+someone declined to do.
 
 **Required pattern** when introducing the allow:
 
@@ -113,9 +113,8 @@ places that each implement their own pre-checks (lease, policy,
 sanitization), they are one pipeline written twice. Every
 safety/policy change must then land in both — and one always lags.
 
-This mirrors the rule in `tools.md` ("Everything Goes Through Tools")
-and `safety-and-sandbox.md` ("Every New Ingress Scans Before Storage
-or LLM"). The pattern: identify the converging downstream call,
+This mirrors the boundary in `safety-and-sandbox.md` ("Mediation is the
+boundary"). The pattern: identify the converging downstream call,
 extract a single gateway, route both sides through it.
 
 **Review flag:** a new call site to a registry/executor/dispatcher
@@ -168,7 +167,7 @@ because each layer catches a different failure mode.
   to name the aggregation that is missing — reviewers reject
   exempts without a plan link.
 - **This rule file is the agent-facing summary.** Loaded into context
-  whenever an agent edits `crates/**/*.rs` or `src/**/*.rs`. The
+  whenever an agent edits `crates/**/*.rs`. The
   agent's job: *don't be the one who adds the twelfth `#[allow]`.*
 
 ## Annotation format (consistent with other rules)
@@ -201,11 +200,22 @@ exempt without a plan link is a violation, not an exception.
 - **One-off scripts under `scripts/`.** Architectural sprawl in a
   shell script or migration helper is a different conversation.
 
+## Direction: the consolidation plan for this debt
+
+The smells above are symptoms of duplicated ownership, optional production
+dependencies, and parallel execution paths. When an exemption is necessary,
+name the missing owner or aggregation in the `arch-exempt` comment and link the
+current issue or contract that governs the follow-up. Do not cite deleted plan
+documents as architectural authority.
+
 ## References
 
 - Adjacent rules with the same shape (extract a single gateway,
-  route everything through it): `tools.md`, `safety-and-sandbox.md`,
+  route everything through it): `safety-and-sandbox.md`,
   `gateway-events.md`.
-- Annotation discipline reference: `gateway-events.md` —
-  `// projection-exempt: <category>, <detail>` is the canonical
-  shape this rule borrows.
+- Type location/multiplicity (mirror DTOs, `host_api` ownership):
+  `type-placement.md` — the rule the capability-path collapse applies.
+- Annotation discipline: the canonical shape is this rule's own
+  `// arch-exempt: <category>, <detail>, plan #NNNN`, enforced by the
+  `ARCH-SPRAWL` checks in `scripts/pre-commit-safety.sh`. (`gateway-events.md`
+  carries no `projection-exempt` convention; that cross-reference was wrong.)

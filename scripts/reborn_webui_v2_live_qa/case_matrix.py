@@ -29,12 +29,18 @@ class CaseSpec:
         requires_google_runtime_access: bool = False,
         requires_telegram: bool = False,
         requires_github_auth: bool = False,
+        expects_llm_trace: bool = True,
         default_enabled: bool = True,
         implemented: bool = True,
+        retry_policy: str = "transient",
     ) -> None:
         if tier not in ("contract", "behavioral"):
             raise ValueError(
                 "CaseSpec tier must be exactly 'contract' or 'behavioral'"
+            )
+        if retry_policy not in ("transient", "never"):
+            raise ValueError(
+                "CaseSpec retry_policy must be exactly 'transient' or 'never'"
             )
         self.fn = fn
         self.tier = tier
@@ -46,8 +52,10 @@ class CaseSpec:
         self.requires_google_runtime_access = requires_google_runtime_access
         self.requires_telegram = requires_telegram
         self.requires_github_auth = requires_github_auth
+        self.expects_llm_trace = expects_llm_trace
         self.default_enabled = default_enabled
         self.implemented = implemented
+        self.retry_policy = retry_policy
 
 
 def qa_row_sort_key(row_id: str) -> tuple[int, str]:
@@ -61,17 +69,35 @@ QA_SHEET_CASES: dict[str, dict[str, object]] = {
     "qa_1a_telegram_connect": {
         "rows": ["1A"],
         "feature": "Telegram connection flow",
-        "gate": "requires live Telegram bot/user credentials and OAuth/pairing automation",
+        "gate": (
+            "requires a live Telegram bot token (admin setup: POST "
+            "/api/webchat/v2/extensions/telegram/setup, bot_token only), a "
+            "public HTTPS base for the /webhooks/extensions/telegram/updates "
+            "webhook, and pairing automation via POST "
+            "/api/webchat/v2/extensions/telegram/pairing/mint plus GET "
+            "/api/webchat/v2/extensions/telegram/pairing/status (the deep-link "
+            "code is consumed through the extension webhook)"
+        ),
     },
     "qa_1b_telegram_near_news_chat": {
         "rows": ["1B"],
         "feature": "Telegram NEAR AI news summary delivery",
-        "gate": "requires live Telegram connection and live Twitter/X or web search access",
+        "gate": (
+            "requires a paired Telegram account (admin setup + POST "
+            "/api/webchat/v2/extensions/telegram/pairing/mint + GET "
+            "/api/webchat/v2/extensions/telegram/pairing/status) and live Twitter/X "
+            "or web search access"
+        ),
     },
     "qa_1c_telegram_near_news_routine": {
         "rows": ["1C"],
         "feature": "Scheduled Telegram NEAR AI news digest routine",
-        "gate": "requires live Telegram connection and routine delivery verification",
+        "gate": (
+            "requires a paired Telegram account (admin setup + POST "
+            "/api/webchat/v2/extensions/telegram/pairing/mint + GET "
+            "/api/webchat/v2/extensions/telegram/pairing/status) and routine delivery "
+            "verification into the paired DM"
+        ),
     },
     "qa_2a_gmail_connect": {
         "rows": ["2A"],
@@ -269,8 +295,8 @@ QA_SHEET_CASES: dict[str, dict[str, object]] = {
     "qa_9d_routine_per_trigger_delivery_target": {
         "rows": ["9D"],
         "feature": (
-            "Routine routed through its own delivery_target_id end to end "
-            "(per-trigger routing probe)"
+            "Routine routed through its own prompt-pinned builtin__outbound_deliver "
+            "destination end to end (per-trigger routing probe)"
         ),
         "gate": "requires live Slack message delivery verification",
     },
@@ -313,8 +339,8 @@ QA_SHEET_CASES: dict[str, dict[str, object]] = {
     "qa_10e_slack_error_honesty": {
         "rows": ["10E"],
         "feature": (
-            "Slack error honesty: the exact Slack error code "
-            "(channel_not_found) reaches the user (pins host error-code erasure)"
+            "Slack error honesty: the canonical messaging error code "
+            "(messaging.unknown_conversation) reaches the user"
         ),
         "gate": "requires live Slack personal OAuth",
     },

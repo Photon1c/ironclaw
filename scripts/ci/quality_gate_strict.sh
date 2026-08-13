@@ -39,21 +39,20 @@ require_command pnpm "enable with: corepack enable pnpm"
 pnpm --version
 
 echo "==> WebUI frontend build"
+# Resolved by crate NAME through the shared inventory
+# (scripts/ci/lib/crate_tree.py) rather than a literal `crates/ironclaw_webui`
+# path, so the target-architecture family move (PROPOSAL §5) cannot leave this
+# `cd` pointed at a directory that no longer exists
+# (docs/reborn/target-architecture/CHECKLIST.md WS10).
+webui_frontend_dir="$("$(git rev-parse --show-toplevel)/scripts/ci/crate-dir.sh" ironclaw_webui)/frontend"
 (
-    cd crates/ironclaw_webui_v2/frontend
+    cd "$webui_frontend_dir"
     pnpm install --frozen-lockfile
     pnpm build
 )
 
 echo "==> clippy (all warnings)"
 cargo clippy --locked --all --benches --tests --examples --all-features -- -D warnings
-
-# Feature-matrix leg: the libsql-only build surfaces `cfg`/`dead_code` lints
-# that the all-features build hides (a variant constructed only under other
-# features reads as never-constructed here). This is the class that reds
-# `Clippy (libsql-only)` on main — e.g. the `Prebuilt` dead_code break (#5840).
-echo "==> clippy (libsql-only feature leg)"
-cargo clippy --locked --no-default-features --features libsql --all-targets -- -D warnings
 
 echo "==> static: include_str! paths + Docker COPY coverage"
 "$(git rev-parse --show-toplevel)/scripts/ci/check-include-str-paths.sh"
@@ -63,4 +62,4 @@ require_command cargo-deny "install with: cargo install cargo-deny"
 cargo deny check
 
 echo "==> tests"
-cargo test --locked
+cargo test --locked --workspace

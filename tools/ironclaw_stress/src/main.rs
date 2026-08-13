@@ -12,6 +12,7 @@ mod ramp;
 mod redaction;
 mod report;
 mod resource_ops;
+mod scripted;
 mod secret_ops;
 mod suite;
 mod summary;
@@ -35,7 +36,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "postgres")]
 use crate::redaction::redact_postgres_url;
 use crate::{
     api_capacity::ApiCapacitySummary,
@@ -60,7 +60,9 @@ use crate::{
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
 use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
-    MountAlias, MountGrant, MountPermissions, MountView, TenantId, VirtualPath,
+    ids::TenantId,
+    mount::{MountGrant, MountPermissions, MountView},
+    path::{MountAlias, VirtualPath},
 };
 use ironclaw_resources::{FilesystemResourceGovernor, ResourceAccount, ResourceGovernor};
 use serde::{Deserialize, Serialize};
@@ -112,10 +114,9 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 0)]
     pub(crate) active_thread_count: usize,
 
-    /// Distinct threads per owner-user that share one `/turns/state.json`. Set
-    /// above 1 to reproduce the production contention shape (a user's foreground
-    /// turn plus routine turns on different threads concurrently writing the same
-    /// per-user turn-state document). Default 1 = one thread per owner.
+    /// Distinct threads per owner-user that share one process-journal mount. Set
+    /// above 1 to exercise cross-thread writes against one owner's journal.
+    /// Default 1 = one thread per owner.
     #[arg(long, default_value_t = 1)]
     pub(crate) threads_per_owner: usize,
 
@@ -135,39 +136,20 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 4)]
     pub(crate) prefill_concurrency: usize,
 
-    /// Exercise the gate-blocked turn path: every Nth measured user-turn
-    /// operation blocks its run on a gate (alternating approval/auth), resumes
-    /// it, then re-claims and completes. 0 (default) = never block, the pure
-    /// claim/complete hot path. Combine with
-    /// `--turn-state-backend memory-persist-on-block` to drive persist-on-block
-    /// writes under concurrency and confirm the durable sink does not
-    /// reintroduce contention.
+    /// Exercise the gate-blocked process path: every Nth measured user-turn
+    /// operation suspends on a gate (alternating approval/auth), resumes, then
+    /// reclaims and completes. 0 (default) is the submit/claim/complete path.
     #[arg(long, default_value_t = 0)]
     pub(crate) gate_blocked_every: usize,
 
     #[arg(long, value_enum, default_value_t = Scenario::ReserveRelease)]
     pub(crate) scenario: Scenario,
 
-    /// Turn-state store backend for user-turn scenarios. `filesystem` = durable
-    /// per-user state.json (CAS, current production path);
-    /// `filesystem-row` = durable typed append-log deltas with a hot
-    /// in-process row cache; `memory` = one shared in-process authority
-    /// (runtime-wedge prototype). No effect on non-turn scenarios.
-    #[arg(long, value_enum, default_value_t = TurnStateBackend::Filesystem)]
-    pub(crate) turn_state_backend: TurnStateBackend,
-
-    /// Override max retained terminal run records in the turn-state store.
-    /// Useful for measuring filesystem snapshot growth sensitivity.
-    #[arg(long)]
-    pub(crate) turn_state_max_terminal_records: Option<usize>,
-
-    /// Override max retained lifecycle events in the turn-state store.
-    #[arg(long)]
-    pub(crate) turn_state_max_events: Option<usize>,
-
-    /// Override max retained idempotency records per operation family.
-    #[arg(long)]
-    pub(crate) turn_state_max_idempotency_records: Option<usize>,
+    /// Process-journal backend for user-turn scenarios.
+    /// `filesystem-journal` persists the production journal shape;
+    /// `memory-journal` removes durable-backend cost.
+    #[arg(long, value_enum, default_value_t = ProcessJournalBackend::FilesystemJournal)]
+    pub(crate) process_journal_backend: ProcessJournalBackend,
 
     /// Shared run id. Defaults to a fresh UUID.
     #[arg(long)]
@@ -244,6 +226,32 @@ pub(crate) struct Args {
     /// Concurrent setup creates for API scenario user threads.
     #[arg(long, default_value_t = 16)]
     pub(crate) api_setup_concurrency: usize,
+
+    /// Scripted tool-call workload for api-user-capacity: each operation is
+    /// driven through a configured builtin/memory tool sequence and verified
+    /// by its read-back verdict (issue #7360 Phase 1).
+    #[arg(long, value_enum)]
+    pub(crate) api_scripted_tool: Option<scripted::ScriptKey>,
+
+    /// Document sizes in bytes to cycle through for scripted operations.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "4096,32768,131072,1048576"
+    )]
+    pub(crate) api_scripted_doc_sizes: Vec<usize>,
+
+    /// Concurrent scripted writers sharing the first user's thread so they
+    /// contend on the same durable document. 0 disables hot-writer
+    /// contention.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) api_hot_writers: usize,
+
+    /// Threads created per API user during setup. Values above 1 exercise
+    /// listing/read paths against large sidebars; sends still target each
+    /// user's first thread.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) api_threads_per_user: usize,
 
     /// Background long-running API users to run alongside foreground api-user-capacity sends.
     #[arg(long, default_value_t = 0)]
@@ -437,9 +445,18 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 20)]
     pub(crate) context_max_messages: usize,
 
-    /// Threads to seed under one scope for the thread-list read workload.
+    /// Total threads to seed for the thread-list read workload.
     #[arg(long, default_value_t = 1000)]
     pub(crate) thread_list_threads: usize,
+
+    /// Owners across which thread-list seed rows are distributed.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) thread_list_users: usize,
+
+    /// Seed thread-list threads without titles, each carrying one accepted
+    /// user message — the shape that exercises sidebar title derivation.
+    #[arg(long, default_value_t = false)]
+    pub(crate) thread_list_untitled: bool,
 
     /// Page size used while walking the thread-list workload.
     #[arg(long, default_value_t = 50)]
@@ -526,20 +543,6 @@ impl Args {
         }
     }
 
-    pub(crate) fn turn_state_store_limits(&self) -> ironclaw_turns::InMemoryTurnStateStoreLimits {
-        let defaults = ironclaw_turns::InMemoryTurnStateStoreLimits::default();
-        ironclaw_turns::InMemoryTurnStateStoreLimits {
-            max_events: self.turn_state_max_events.unwrap_or(defaults.max_events),
-            max_terminal_records: self
-                .turn_state_max_terminal_records
-                .unwrap_or(defaults.max_terminal_records),
-            max_idempotency_records: self
-                .turn_state_max_idempotency_records
-                .unwrap_or(defaults.max_idempotency_records),
-            ..defaults
-        }
-    }
-
     pub(crate) fn warmup_args(&self) -> Option<Self> {
         if self.warmup_seconds == 0 {
             return None;
@@ -607,39 +610,20 @@ impl Backend {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum TurnStateBackend {
-    /// Durable per-user `state.json` via the filesystem store (per-step CAS
-    /// read-modify-write). The current production path; livelocks under
-    /// concurrent same-user writers.
-    Filesystem,
-    /// Durable typed append-log deltas with one hot in-process store per
-    /// tenant/user. Candidate filesystem fix for the blob growth curve.
-    FilesystemRow,
-    /// One shared in-process `InMemoryTurnStateStore` authority — coordination
-    /// in memory, no per-step CAS. Prototype for the runtime-wedge fix.
-    Memory,
-    /// The shipped hosted-single-tenant-volume config: the shared in-memory
-    /// authority with a durable persist-on-block sink attached. The sink fires
-    /// only when the gate-blocked set changes (off the hot path), so this
-    /// measures the extra cost the durability wiring adds to the normal
-    /// claim/complete path versus plain `Memory`.
-    MemoryPersistOnBlock,
+pub(crate) enum ProcessJournalBackend {
+    /// The production process journal over the selected durable filesystem.
+    FilesystemJournal,
+    /// The same process journal over an in-memory `RootFilesystem`, removing
+    /// durable-backend cost while preserving journal serialization and CAS.
+    MemoryJournal,
 }
 
-impl TurnStateBackend {
+impl ProcessJournalBackend {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Filesystem => "filesystem",
-            Self::FilesystemRow => "filesystem-row",
-            Self::Memory => "memory",
-            Self::MemoryPersistOnBlock => "memory-persist-on-block",
+            Self::FilesystemJournal => "filesystem-journal",
+            Self::MemoryJournal => "memory-journal",
         }
-    }
-
-    /// Whether a durable persist-on-block sink is attached to the in-memory
-    /// authority.
-    pub(crate) fn persists_on_block(self) -> bool {
-        matches!(self, Self::MemoryPersistOnBlock)
     }
 }
 
@@ -838,10 +822,7 @@ struct RunSummary {
     users: usize,
     active_thread_count: usize,
     threads_per_owner: usize,
-    turn_state_backend: TurnStateBackend,
-    turn_state_max_terminal_records: Option<usize>,
-    turn_state_max_events: Option<usize>,
-    turn_state_max_idempotency_records: Option<usize>,
+    process_journal_backend: ProcessJournalBackend,
     gate_blocked_every: usize,
     tenants: usize,
     prefill_threads: usize,
@@ -859,6 +840,7 @@ struct RunSummary {
     assistant_message_bytes: usize,
     context_max_messages: usize,
     thread_list_threads: usize,
+    thread_list_users: usize,
     thread_list_page_size: usize,
     context_growth_turns_per_operation: usize,
     tool_calls_per_turn: usize,
@@ -1148,6 +1130,41 @@ fn validate_args(args: &Args) -> Result<(), String> {
         );
     }
     api_capacity::validate_read_mix(&args.api_read_mix)?;
+    if let Some(key) = &args.api_scripted_tool {
+        if !args.scenario.is_api_capacity() {
+            return Err("--api-scripted-tool requires --scenario api-user-capacity".to_string());
+        }
+        if *key == scripted::ScriptKey::WriteFileRoundtrip && args.api_hot_writers > 0 {
+            return Err(
+                "--api-hot-writers requires a memory script (memory_roundtrip, memory_grow, \
+                 or memory_mixed); write_file_roundtrip targets a per-operation path and \
+                 cannot exercise shared-document contention"
+                    .to_string(),
+            );
+        }
+        if args.mock_llm_bind.is_none() {
+            return Err("--api-scripted-tool requires --mock-llm-bind".to_string());
+        }
+        if !args.api_wait_for_assistant {
+            return Err("--api-scripted-tool requires --api-wait-for-assistant".to_string());
+        }
+        if args.api_scripted_doc_sizes.is_empty() {
+            return Err("--api-scripted-doc-sizes must not be empty".to_string());
+        }
+        for size in &args.api_scripted_doc_sizes {
+            if *size < scripted::MIN_SCRIPTED_DOC_SIZE_BYTES
+                || *size > scripted::MAX_SCRIPTED_DOC_SIZE_BYTES
+            {
+                return Err(format!(
+                    "--api-scripted-doc-sizes values must be between {} and {} bytes",
+                    scripted::MIN_SCRIPTED_DOC_SIZE_BYTES,
+                    scripted::MAX_SCRIPTED_DOC_SIZE_BYTES
+                ));
+            }
+        }
+    } else if args.api_hot_writers > 0 {
+        return Err("--api-hot-writers requires --api-scripted-tool".to_string());
+    }
     if !(0.0..=1.0).contains(&args.mock_llm_failure_rate) {
         return Err("--mock-llm-failure-rate must be between 0.0 and 1.0".to_string());
     }
@@ -1342,6 +1359,9 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.thread_list_threads == 0 {
         return Err("--thread-list-threads must be greater than 0".to_string());
     }
+    if args.thread_list_users == 0 || args.thread_list_users > args.users {
+        return Err("--thread-list-users must be between 1 and --users".to_string());
+    }
     if args.thread_list_page_size == 0 || args.thread_list_page_size > 200 {
         return Err("--thread-list-page-size must be between 1 and 200".to_string());
     }
@@ -1492,8 +1512,8 @@ fn run_child_processes(args: &Args, run_id: &str) -> Result<Vec<RunSummary>, Str
             .arg(args.prefill_concurrency.to_string())
             .arg("--scenario")
             .arg(args.scenario.as_str())
-            .arg("--turn-state-backend")
-            .arg(args.turn_state_backend.as_str())
+            .arg("--process-journal-backend")
+            .arg(args.process_journal_backend.as_str())
             .arg("--postgres-pool-size")
             .arg(args.postgres_pool_size.to_string())
             .arg("--progress-interval-seconds")
@@ -1522,6 +1542,8 @@ fn run_child_processes(args: &Args, run_id: &str) -> Result<Vec<RunSummary>, Str
             .arg(args.context_max_messages.to_string())
             .arg("--thread-list-threads")
             .arg(args.thread_list_threads.to_string())
+            .arg("--thread-list-users")
+            .arg(args.thread_list_users.to_string())
             .arg("--thread-list-page-size")
             .arg(args.thread_list_page_size.to_string())
             .arg("--context-growth-turns-per-operation")
@@ -1555,21 +1577,6 @@ fn run_child_processes(args: &Args, run_id: &str) -> Result<Vec<RunSummary>, Str
         }
         if args.span_log_failures {
             command.arg("--span-log-failures");
-        }
-        if let Some(max_terminal_records) = args.turn_state_max_terminal_records {
-            command
-                .arg("--turn-state-max-terminal-records")
-                .arg(max_terminal_records.to_string());
-        }
-        if let Some(max_events) = args.turn_state_max_events {
-            command
-                .arg("--turn-state-max-events")
-                .arg(max_events.to_string());
-        }
-        if let Some(max_idempotency_records) = args.turn_state_max_idempotency_records {
-            command
-                .arg("--turn-state-max-idempotency-records")
-                .arg(max_idempotency_records.to_string());
         }
         if let Some(path) = &args.trace_jsonl {
             command
@@ -2223,10 +2230,7 @@ fn summarize(args: &Args, run_id: &str, input: SummaryInput) -> RunSummary {
         users: args.users,
         active_thread_count: args.active_thread_count,
         threads_per_owner: args.threads_per_owner,
-        turn_state_backend: args.turn_state_backend,
-        turn_state_max_terminal_records: args.turn_state_max_terminal_records,
-        turn_state_max_events: args.turn_state_max_events,
-        turn_state_max_idempotency_records: args.turn_state_max_idempotency_records,
+        process_journal_backend: args.process_journal_backend,
         gate_blocked_every: args.gate_blocked_every,
         tenants: args.tenants,
         prefill_threads: args.prefill_threads,
@@ -2244,6 +2248,7 @@ fn summarize(args: &Args, run_id: &str, input: SummaryInput) -> RunSummary {
         assistant_message_bytes: args.assistant_message_bytes,
         context_max_messages: args.context_max_messages,
         thread_list_threads: args.thread_list_threads,
+        thread_list_users: args.thread_list_users,
         thread_list_page_size: args.thread_list_page_size,
         context_growth_turns_per_operation: args.context_growth_turns_per_operation,
         tool_calls_per_turn: args.tool_calls_per_turn,
@@ -2285,7 +2290,6 @@ async fn build_backend(args: &Args, run_id: &str) -> Result<BackendHandle, Strin
     }
 }
 
-#[cfg(feature = "libsql")]
 async fn build_libsql_backend(args: &Args, run_id: &str) -> Result<BackendHandle, String> {
     let (filesystem, target) = build_libsql_root(args).await?;
     Ok(BackendHandle {
@@ -2294,7 +2298,6 @@ async fn build_libsql_backend(args: &Args, run_id: &str) -> Result<BackendHandle
     })
 }
 
-#[cfg(feature = "libsql")]
 pub(crate) async fn build_libsql_root(
     args: &Args,
 ) -> Result<(Arc<ironclaw_filesystem::LibSqlRootFilesystem>, String), String> {
@@ -2312,17 +2315,11 @@ pub(crate) async fn build_libsql_root(
             .await
             .map_err(display_err)?,
     );
-    let filesystem = Arc::new(LibSqlRootFilesystem::new(db));
+    let filesystem = Arc::new(LibSqlRootFilesystem::new(db).map_err(display_err)?);
     filesystem.run_migrations().await.map_err(display_err)?;
     Ok((filesystem, redact_libsql_path(&path)))
 }
 
-#[cfg(not(feature = "libsql"))]
-async fn build_libsql_backend(_args: &Args, _run_id: &str) -> Result<BackendHandle, String> {
-    Err("binary was built without the libsql feature".to_string())
-}
-
-#[cfg(feature = "postgres")]
 async fn build_postgres_backend(args: &Args, run_id: &str) -> Result<BackendHandle, String> {
     let (filesystem, _pool, target) = build_postgres_root_and_pool(args).await?;
     Ok(BackendHandle {
@@ -2331,7 +2328,6 @@ async fn build_postgres_backend(args: &Args, run_id: &str) -> Result<BackendHand
     })
 }
 
-#[cfg(feature = "postgres")]
 pub(crate) async fn build_postgres_root_and_pool(
     args: &Args,
 ) -> Result<
@@ -2356,11 +2352,6 @@ pub(crate) async fn build_postgres_root_and_pool(
     let filesystem = Arc::new(PostgresRootFilesystem::new(pool.clone()));
     filesystem.run_migrations().await.map_err(display_err)?;
     Ok((filesystem, pool, redact_postgres_url(&url)))
-}
-
-#[cfg(not(feature = "postgres"))]
-async fn build_postgres_backend(_args: &Args, _run_id: &str) -> Result<BackendHandle, String> {
-    Err("binary was built without the postgres feature".to_string())
 }
 
 pub(crate) fn governor_from_root<F>(
@@ -2391,12 +2382,21 @@ pub(crate) fn default_libsql_path() -> PathBuf {
     ))
 }
 
-async fn cleanup_generated_libsql_path(path: &Path) {
-    for candidate in [
-        path.to_path_buf(),
-        path.with_extension("db-wal"),
-        path.with_extension("db-shm"),
-    ] {
+pub(crate) async fn cleanup_generated_libsql_path(path: &Path) {
+    // SQLite appends `-wal`/`-shm` to the whole file name; it does not replace
+    // the extension. `with_extension("db-wal")` only lined up when the path
+    // ended in `.db`, so an explicit `--libsql-path bench.sqlite` left
+    // `bench-<case>.sqlite-wal` and `-shm` behind on every run.
+    // Appended as `OsString`, not through `to_string_lossy`: a lossy round trip
+    // substitutes replacement characters for a valid non-UTF-8 filename, so the
+    // derived paths would not name the files SQLite actually created and the
+    // sidecars would survive the cleanup meant to remove them.
+    let sidecars = ["-wal", "-shm"].map(|suffix| {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    });
+    for candidate in [path.to_path_buf(), sidecars[0].clone(), sidecars[1].clone()] {
         match tokio::fs::remove_file(&candidate).await {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -2443,7 +2443,6 @@ fn panic_payload_to_string(payload: &Box<dyn Any + Send + 'static>) -> String {
     "non-string panic payload".to_string()
 }
 
-#[cfg(feature = "postgres")]
 pub(crate) fn resolve_postgres_url(args: &Args) -> Result<String, String> {
     if let Some(url) = args.postgres_url.clone() {
         return Ok(url);
@@ -2461,7 +2460,6 @@ pub(crate) fn resolve_postgres_url(args: &Args) -> Result<String, String> {
     )
 }
 
-#[cfg(feature = "postgres")]
 fn optional_env_var(name: &str) -> Result<Option<String>, String> {
     match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
@@ -2473,3 +2471,4 @@ fn optional_env_var(name: &str) -> Result<Option<String>, String> {
 fn display_err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
+// arch-exempt: large_file, stress harness orchestration remains centralized, plan #6175

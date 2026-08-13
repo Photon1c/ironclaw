@@ -58,6 +58,10 @@ async fn skill_activate_dispatches_and_injects_skill_context() {
         .assert_tool_result_contains("\"count\":1")
         .await
         .expect("skill_activate reported one skill activated");
+    harness
+        .assert_tool_result_contains("\"activated\":[\"greet\"]")
+        .await
+        .expect("skill_activate reported the explicitly requested skill");
 
     // Model-invoked skill discovery: before activation the skill advertises
     // itself as a one-line `- name: description` listing entry (the first
@@ -129,9 +133,15 @@ async fn skill_criteria_auto_activation_stays_off_on_coordinator_path() {
         .await
         .expect("non-activated skill must appear as a one-line listing entry");
     harness
-        .assert_model_request_contains("builtin.skill_activate when it matches the task")
+        .assert_model_message_content_in_order(&[
+            "The following skills are available for use with builtin.skill_activate.",
+            "activate it FIRST and follow its instructions instead of your own default approach",
+            "Choose the smallest relevant set, with at most eight active skills total per run; large skills may reduce that number.",
+            "do not activate it even when it looks adjacent",
+            "If activation reports an ambiguous name, do not guess; explain the conflict.",
+        ])
         .await
-        .expect("listing header must explain model-invoked activation");
+        .expect("listing header must require deliberate model-invoked skill selection");
 
     // And the explicit capability was never dispatched either.
     assert!(
@@ -140,6 +150,142 @@ async fn skill_criteria_auto_activation_stays_off_on_coordinator_path() {
             .await
             .is_err(),
         "builtin.skill_activate must NOT have been invoked without an explicit call"
+    );
+}
+
+#[tokio::test]
+async fn coordinator_listing_uses_descriptor_order_without_criteria_input() {
+    // Seeded BEFORE the group boots: skills are read from the database tree, and the host-disk
+    // store is migrated into it at boot, so a skill written after this point is never picked up.
+    let group = RebornIntegrationGroup::skill_activation_tools_with_user_skills(&[
+        (
+            "alpha",
+            "alpha baseline skill",
+            "ALPHA_SKILL_SENTINEL",
+            false,
+        ),
+        ("zulu", "zulu baseline skill", "ZULU_SKILL_SENTINEL", false),
+    ])
+    .await
+    .expect("skill-activation group builds");
+    let harness = group
+        .thread("conv-skill-listing-order")
+        .script([RebornScriptedReply::text("done")])
+        .build()
+        .await
+        .expect("thread builds");
+    harness
+        .submit_turn("a request unrelated to the seeded activation keywords")
+        .await
+        .expect("turn completes");
+
+    harness
+        .assert_model_message_content_in_order(&[
+            "- greet: greets the user warmly",
+            "- alpha: alpha baseline skill",
+            "- zulu: zulu baseline skill",
+        ])
+        .await
+        .expect("coordinator listing must preserve source-then-name descriptor order");
+}
+
+#[tokio::test]
+async fn unknown_skill_activation_is_a_noop_and_the_run_continues() {
+    let group = RebornIntegrationGroup::skill_activation_tools()
+        .await
+        .expect("skill-activation group builds");
+    let harness = group
+        .thread("conv-skill-activate-unknown")
+        .script([
+            RebornScriptedReply::tool_call(
+                "builtin.skill_activate",
+                json!({"names": ["missing-helper"]}),
+            ),
+            RebornScriptedReply::text("the requested skill was unavailable"),
+        ])
+        .build()
+        .await
+        .expect("thread builds");
+
+    harness
+        .submit_turn("use the missing helper")
+        .await
+        .expect("turn completes despite the missing skill");
+
+    harness
+        .assert_tool_invoked("builtin.skill_activate")
+        .await
+        .expect("skill_activate dispatched through the real capability");
+    harness
+        .assert_tool_result_contains("\"count\":0")
+        .await
+        .expect("unknown skill currently produces an empty activation result");
+    harness
+        .assert_tool_result_contains("\"activated\":[]")
+        .await
+        .expect("unknown skill must not activate another candidate");
+    harness
+        .assert_reply_contains("requested skill was unavailable")
+        .await
+        .expect("model received another turn after the no-op activation");
+    let err = harness
+        .assert_model_request_contains("GREET_SKILL_PROMPT_SENTINEL")
+        .await
+        .expect_err("a missing request must not inject a different skill");
+    assert!(
+        err.to_string().starts_with("no model request contained"),
+        "expected the intended \"not found\" assertion failure, got a different harness error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn installed_skill_is_listed_but_not_model_activatable() {
+    // `installed: true` adds the URL-install provenance sidecar, which is what downgrades the
+    // bundle's trust to `Installed`. Seeded pre-boot for the same reason as the listing test.
+    let group = RebornIntegrationGroup::skill_activation_tools_with_user_skills(&[(
+        "remote-helper",
+        "a remotely installed helper",
+        "REMOTE_INSTALLED_SKILL_SENTINEL",
+        true,
+    )])
+    .await
+    .expect("skill-activation group builds");
+    let harness = group
+        .thread("conv-skill-activate-installed")
+        .script([
+            RebornScriptedReply::tool_call(
+                "builtin.skill_activate",
+                json!({"names": ["remote-helper"]}),
+            ),
+            RebornScriptedReply::text("the installed skill was unavailable"),
+        ])
+        .build()
+        .await
+        .expect("thread builds");
+    harness
+        .submit_turn("use the remote helper")
+        .await
+        .expect("turn completes despite installed skill trust");
+
+    harness
+        .assert_model_request_contains("- remote-helper: a remotely installed helper")
+        .await
+        .expect("installed skill remains safely discoverable");
+    harness
+        .assert_tool_result_contains("\"count\":0")
+        .await
+        .expect("installed skill is not admitted by model-selected activation");
+    harness
+        .assert_tool_result_contains("\"activated\":[]")
+        .await
+        .expect("installed skill must not activate another candidate");
+    let err = harness
+        .assert_model_request_contains("REMOTE_INSTALLED_SKILL_SENTINEL")
+        .await
+        .expect_err("installed skill prompt body must remain hidden");
+    assert!(
+        err.to_string().starts_with("no model request contained"),
+        "expected the intended \"not found\" assertion failure, got a different harness error: {err}"
     );
 }
 
@@ -219,9 +365,16 @@ fn skill_activate_ambiguous_name_surfaces_recoverable_failed() {
     run_async_test_with_stack(
         "skill_activate_ambiguous_name_surfaces_recoverable_failed",
         || async {
-            let group = RebornIntegrationGroup::skill_activation_tools()
-                .await
-                .expect("skill-activation group builds");
+            // The user-scoped half of the ambiguous pair must exist before boot; the system half
+            // is seeded below, against the system tree the runtime re-reads.
+            let group = RebornIntegrationGroup::skill_activation_tools_with_user_skills(&[(
+                "duplicate",
+                "a user-scoped skill",
+                "USER_DUPLICATE_SKILL_SENTINEL",
+                false,
+            )])
+            .await
+            .expect("skill-activation group builds");
             let capability_harness = group
                 .capability_harness()
                 .expect("skill-activation group has a host-runtime capability harness");
@@ -245,19 +398,6 @@ fn skill_activate_ambiguous_name_surfaces_recoverable_failed() {
                 .build()
                 .await
                 .expect("thread builds");
-            // The user-scoped root is seeded under the SAME (tenant, actor) the built
-            // thread's run resolves under (`harness.binding`) — only then does the
-            // user `/skills` mount the run actually reads from contain this file.
-            capability_harness
-                .seed_user_skill_for_test(
-                    &harness.binding.tenant_id,
-                    &harness.binding.actor_user_id,
-                    "duplicate",
-                    "a user-scoped skill",
-                    "USER_DUPLICATE_SKILL_SENTINEL",
-                )
-                .expect("user-scoped duplicate skill seeds");
-
             harness
                 .submit_turn("activate the duplicate skill")
                 .await
@@ -272,6 +412,16 @@ fn skill_activate_ambiguous_name_surfaces_recoverable_failed() {
                 .assert_reply_contains("that name is ambiguous")
                 .await
                 .expect("run recovered and finalized");
+            harness
+                .assert_model_message_content_in_order(&[
+                    "- duplicate: a system-scoped skill",
+                    "- greet: greets the user warmly",
+                    "- duplicate: a user-scoped skill",
+                ])
+                .await
+                .expect(
+                    "the baseline listing exposes ambiguous bare names without qualified recovery identifiers",
+                );
             // Neither candidate's instructions may leak into a later model request —
             // an ambiguous selection activates nothing.
             for sentinel in [
